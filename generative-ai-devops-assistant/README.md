@@ -3,25 +3,6 @@
 ## Overview
 This project is a Python-based Discord bot designed to assist with DevOps tasks using a large language model (LLM) like Gemini Pro. The bot interacts with users on Discord and provides helpful responses based on the tasks and queries related to DevOps.
 
-## Project Structure
-```
-generative-ai-devops-assistant
-├── bot
-│   ├── __init__.py
-│   ├── discord_bot.py
-│   ├── llm_client.py
-│   ├── config.py
-│   └── utils.py
-├── tests
-│   ├── test_llm_client.py
-│   └── test_discord_bot.py
-├── .env
-├── .gitignore
-├── requirements.txt
-├── README.md
-└── run_bot.py
-```
-
 ## Setup Instructions
 
 ### Prerequisites
