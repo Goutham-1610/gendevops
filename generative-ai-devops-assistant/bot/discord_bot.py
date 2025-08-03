@@ -13,6 +13,8 @@ from bot.llm_client import get_gemini_response, get_gemini_file_response
 from bot.generator import handle_generator_request
 from bot.cicd_generator import handle_cicd_request
 
+from bot.deploy import trigger_github_workflow  # Import deploy function
+
 intents = discord.Intents.default()
 intents.message_content = True
 
@@ -20,11 +22,12 @@ client = discord.Client(intents=intents)
 
 MAX_DISCORD_MSG_LEN = 2000
 
-# In-memory sessions for ChatOps: user_id -> session dict
-user_sessions = {}
+# In-memory ChatOps sessions by user_id
+user_sessions: dict[int, dict] = {}
 
-# Helper function to send multi-file output from Gemini nicely split
+
 async def send_separate_generated_files(channel: discord.abc.Messageable, user_id: int, full_output: str):
+    """Parse generated output and send as separate files or one file if parsing fails."""
     dockerfile_match = re.search(r"###\s*Dockerfile\s*\n(.*?)(?=\n###|$)", full_output, re.DOTALL | re.IGNORECASE)
     k8s_match = re.search(r"###\s*Kubernetes manifest\s*\n(.*?)(?=\n###|$)", full_output, re.DOTALL | re.IGNORECASE)
     cicd_match = re.search(r"###\s*CI/CD pipeline\s*\n(.*?)(?=\n###|$)", full_output, re.DOTALL | re.IGNORECASE)
@@ -47,7 +50,6 @@ async def send_separate_generated_files(channel: discord.abc.Messageable, user_i
             files=files_to_send
         )
     else:
-        # Fallback: Send entire content as one text file if no split
         await channel.send(
             f"<@{user_id}> I couldn't detect separate files, sending all content in one file.",
             file=discord.File(io.BytesIO(full_output.encode("utf-8")), filename="generated_files.txt")
@@ -55,9 +57,10 @@ async def send_separate_generated_files(channel: discord.abc.Messageable, user_i
 
 
 async def ask_question(channel: discord.abc.Messageable, user_id: int):
+    """Send next question based on current ChatOps stage."""
     session = user_sessions[user_id]
     stage = session.get('stage', 1)
-    
+
     if stage == 1:
         await channel.send(f"<@{user_id}> What framework are you using? (e.g., Flask, FastAPI, Node.js)")
     elif stage == 2:
@@ -69,20 +72,27 @@ async def ask_question(channel: discord.abc.Messageable, user_id: int):
     elif stage == 4:
         summary = (
             f"Framework: {session.get('framework')}\n"
-            f"HTTPS Ingress: {session.get('https')}\n"
+            f"HTTPS Ingress: {'Yes' if session.get('https') else 'No'}\n"
             f"CI/CD platform: {session.get('cicd')}\n"
             "Type 'yes' to generate the files or 'no' to cancel."
         )
         await channel.send(f"<@{user_id}> Please confirm your choices:\n{summary}")
+    elif stage == 5:
+        await channel.send(
+            f"<@{user_id}> Would you like to trigger deployment on GitHub Actions now? "
+            f"Reply with `deploy` to proceed or `skip` to finish."
+        )
+
 
 @client.event
 async def on_ready() -> None:
     print(f"[DiscordBot] Connected as {client.user}. Ready to handle messages.")
 
+
 @client.event
 async def on_message(message: discord.Message) -> None:
     if message.author.bot:
-        return
+        return  # Ignore bot messages
 
     user_id = message.author.id
     content = message.content.strip()
@@ -91,18 +101,14 @@ async def on_message(message: discord.Message) -> None:
     channel_name: Optional[str] = getattr(channel, "name", None)
 
     # --- ChatOps multi-step session management ---
-    if (
-        content_lower.startswith("!deploy")
-        or content_lower.startswith("/start")
-        or user_id in user_sessions
-    ):
-        # Starting new session
+    if content_lower.startswith("!deploy") or content_lower.startswith("/start") or user_id in user_sessions:
+        # Start new session
         if content_lower.startswith("!deploy") or content_lower.startswith("/start"):
             user_sessions[user_id] = {"stage": 1}
             await ask_question(channel, user_id)
             return
 
-        # Existing session continuation
+        # Continue session
         session = user_sessions[user_id]
         stage = session.get("stage", 1)
 
@@ -112,10 +118,9 @@ async def on_message(message: discord.Message) -> None:
             await ask_question(channel, user_id)
 
         elif stage == 2:
-            if "https" in content_lower or "ingress" in content_lower:
-                session["https"] = True
-            else:
-                session["https"] = False
+            session["https"] = bool(
+                "https" in content_lower or "ingress" in content_lower or "yes" in content_lower
+            )
             session["stage"] = 3
             await ask_question(channel, user_id)
 
@@ -127,6 +132,7 @@ async def on_message(message: discord.Message) -> None:
                 session["cicd"] = user_choice
                 session["stage"] = 4
                 await ask_question(channel, user_id)
+
             else:
                 matches = [opt for opt in cicd_options if user_choice in opt or opt in user_choice]
                 if len(matches) == 1:
@@ -150,7 +156,8 @@ async def on_message(message: discord.Message) -> None:
                     f"### Dockerfile\n"
                     f"Production-ready Dockerfile including multi-stage build, proper user, ports, and comments.\n\n"
                     f"### Kubernetes manifest\n"
-                    f"Best-practice deployment, service, and {'HTTPS Ingress' if session['https'] else 'internal service only'} configuration.\n\n"
+                    f"Best-practice deployment, service, and "
+                    f"{'HTTPS Ingress' if session['https'] else 'internal service only'} configuration.\n\n"
                     f"### CI/CD pipeline\n"
                     f"{session['cicd']} CI/CD YAML for build, test, docker push, and deployment.\n\n"
                     f"Label each section clearly as above."
@@ -162,18 +169,45 @@ async def on_message(message: discord.Message) -> None:
                 except Exception as e:
                     await channel.send(f"<@{user_id}> Error generating files: {e}")
 
-                del user_sessions[user_id]
+                session["stage"] = 5
+                await ask_question(channel, user_id)
 
             else:
                 await channel.send(f"<@{user_id}> Session cancelled.")
-                del user_sessions[user_id]
+                user_sessions.pop(user_id, None)
 
-        return  # ChatOps has exclusive control here
+        elif stage == 5:
+            # Deployment trigger step
+            if content_lower == "deploy":
+                if session.get("cicd") != "github actions":
+                    await channel.send(f"<@{user_id}> Deployment trigger currently supports only GitHub Actions.")
+                else:
+                    repo = "owner/repo"  # TODO: Replace with your GitHub repo
+                    workflow_file = "ci.yml"  # TODO: Replace with your workflow filename
+                    ref = "main"
+                    await channel.send(f"<@{user_id}> Triggering GitHub Actions workflow...")
+
+                    status, response = await trigger_github_workflow(repo, workflow_file, ref)
+
+                    if status == 204:
+                        await channel.send(f"<@{user_id}> ✅ Deployment triggered successfully!")
+                    else:
+                        await channel.send(f"<@{user_id}> ❌ Failed to trigger deployment: {response}")
+
+                user_sessions.pop(user_id, None)
+
+            elif content_lower == "skip":
+                await channel.send(f"<@{user_id}> Deployment skipped. Session finished.")
+                user_sessions.pop(user_id, None)
+            else:
+                await channel.send(f"<@{user_id}> Please reply with `deploy` to trigger deployment or `skip` to finish.")
+
+        return  # ChatOps controls the flow exclusively here
 
     # --- Channel-specific command handlers ---
 
     if channel_name not in TARGET_CHANNEL_NAMES:
-        return  # Ignore messages outside target channels
+        return
 
     try:
         if channel_name == TARGET_CHANNEL_NAME:
@@ -203,6 +237,7 @@ async def on_message(message: discord.Message) -> None:
             await channel.send("Sorry, there was an issue sending the response to the channel.")
         except Exception:
             pass
+
     except Exception as e:
         print(f"[Error in on_message] {e}")
         try:
@@ -210,5 +245,7 @@ async def on_message(message: discord.Message) -> None:
         except Exception:
             pass
 
+
 def run() -> None:
+    """Starts the Discord bot."""
     client.run(DISCORD_TOKEN)
